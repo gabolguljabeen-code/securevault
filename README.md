@@ -1,0 +1,68 @@
+# SecureVault — File Encryption & Decryption System
+
+SecureVault is a Vercel-compatible Next.js App Router project for encrypting and decrypting files in the browser. It uses the Web Crypto API directly: AES-256-GCM for authenticated encryption, with a password-derived key using PBKDF2-SHA-256 and 600,000 iterations. It has no file-processing API, database, account, secret, paid service, or external encryption provider.
+
+> This project lives in `securevault/` so it does not replace the existing MUET Transport application in the repository root. In Vercel, set the project **Root Directory** to `securevault`.
+
+## Architecture and file format
+
+The Next.js app serves the interface and educational information page. All cryptographic operations run in a browser client component through `crypto.subtle`; the server receives ordinary page requests only. File bytes and passwords are not sent to an application endpoint. History is React memory state and disappears when the page session ends or is reloaded.
+
+An encrypted `.svault` file is laid out as:
+
+1. 8-byte `SVAULT01` format marker.
+2. 4-byte big-endian JSON header length.
+3. UTF-8 JSON header with format version, AES-GCM/PBKDF2 identifiers, 600,000 iterations, 16-byte random salt, 12-byte random nonce, original filename, MIME type, and creation time.
+4. AES-256-GCM ciphertext and its 128-bit authentication tag.
+
+The format prefix and header are also authenticated as AES-GCM additional data. If the password is wrong or ciphertext/header bytes change, authentication fails and the app does not offer a plaintext download. The header is readable without a password; it contains no key or password.
+
+## Run locally
+
+Requirements: Node.js 20.9 or newer and npm.
+
+```bash
+cd securevault
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). For a production build, run `npm run build` and then `npm start`.
+
+## Quality checks
+
+```bash
+npm test
+npm run typecheck
+npm run lint
+npm run build
+```
+
+The crypto-format test suite checks encrypt/decrypt round trips, binary and empty files, Unicode and unsafe filenames, wrong passwords, modified ciphertext, malformed headers, and the configured file-size limit.
+
+## Deploy to Vercel through GitHub
+
+1. Commit and push this repository to GitHub.
+2. In Vercel, choose **Add New → Project**, import the GitHub repository, and configure **Root Directory** as `securevault`.
+3. Keep the detected framework as **Next.js**. Use the standard npm install command `npm install`, build command `npm run build`, and leave the output directory at its default (do not set `dist`). No environment variables are required.
+4. Deploy. Future pushes to the connected branch trigger a new deployment. Use the HTTPS deployment URL for the browser Web Crypto API.
+
+The app includes restrictive baseline security headers in `next.config.ts`. Review the Content Security Policy if adding future scripts, analytics, remote assets, or integrations; none are needed by the current app.
+
+## Demonstration for an Information Security class
+
+1. Open the HTTPS deployment or run the app locally. Choose **Encrypt a file** and select a small text or binary file.
+2. Enter and confirm a unique password with at least 12 characters. Encrypt and save the `.svault` download.
+3. Open the downloaded file in a text editor or inspect its first bytes: the header is visible, while file content is ciphertext.
+4. Choose **Decrypt a file**, select that `.svault`, enter the same password, and compare the downloaded original with the source.
+5. Repeat with a wrong password and with a copy of the vault whose ciphertext has been changed. Both must fail authentication and produce no decrypted file.
+6. Reload the page and notice that recent activity is gone. The downloaded encrypted file can still be decrypted, because its non-secret parameters travel inside the authenticated file header.
+
+## Limitations and safe use
+
+- The default configurable cap is 64 MiB (`FILE_SIZE_LIMIT` in `lib/crypto.ts`). Web Crypto currently processes an entire file buffer at once, so peak memory use can be several times the file size. Devices with limited memory may fail below this limit; errors are shown and no streaming is simulated.
+- Browser memory clearing is best effort in JavaScript. The app overwrites temporary typed arrays when possible, but garbage collection and browser internals control final memory release.
+- Use a strong, unique password and keep a separate copy. SecureVault cannot reset passwords or recover a lost key. Anyone with the password and `.svault` file can decrypt it.
+- Browser-based encryption does not protect against malware, a compromised device, malicious browser extensions, or a compromised site/deployment that serves altered JavaScript. A secure connection and trusted device matter.
+- Metadata such as the original filename and MIME type is visible in the `.svault` header. Do not use sensitive information in filenames if that metadata must remain private.
+- No encryption tool guarantees that the entire device or application is secure. Do not treat this educational project as a substitute for a reviewed, audited product or an organizational backup policy.
