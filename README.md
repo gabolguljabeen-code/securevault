@@ -1,12 +1,12 @@
 # SecureVault — File Encryption & Decryption System
 
-SecureVault is a Vercel-compatible Next.js App Router project for encrypting and decrypting files in the browser. It uses the Web Crypto API directly: AES-256-GCM for authenticated encryption, with a password-derived key using PBKDF2-SHA-256 and 600,000 iterations. It has no file-processing API, database, account, secret, paid service, or external encryption provider.
+SecureVault is a Vercel-compatible Next.js App Router project for encrypting and decrypting files in the browser. It uses the Web Crypto API directly: AES-256-GCM for authenticated encryption, with a password-derived key using PBKDF2-SHA-256 and 600,000 iterations. Turso stores only operation-history metadata. No file-processing API, paid service, or external encryption provider is used.
 
-> This project lives in `securevault/` so it does not replace the existing MUET Transport application in the repository root. In Vercel, set the project **Root Directory** to `securevault`.
+The standalone GitHub repository has the Next.js app at its root. In Vercel, leave **Root Directory** at `./`. If deploying from the original MUET Transport repository instead, set it to `securevault`.
 
 ## Architecture and file format
 
-The Next.js app serves the interface and educational information page. All cryptographic operations run in a browser client component through `crypto.subtle`; the server receives ordinary page requests only. File bytes and passwords are not sent to an application endpoint. History is React memory state and disappears when the page session ends or is reloaded.
+The Next.js app serves the interface and educational information page. All cryptographic operations run in a browser client component through `crypto.subtle`; file bytes, passwords, and encryption keys are never sent to the server. Next.js route handlers write operation metadata to Turso using the server-only `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` environment variables. The database contains each operation's filename, type, size, algorithm, timestamp, and an anonymous browser identifier. It keeps the latest 50 records per browser. A random, HTTP-only cookie scopes history to that browser; it does not create an account or sync history across devices. The browser owner can clear that browser's history in the app. Treat filenames as potentially sensitive because they are stored in Turso.
 
 An encrypted `.svault` file is laid out as:
 
@@ -22,12 +22,24 @@ The format prefix and header are also authenticated as AES-GCM additional data. 
 Requirements: Node.js 20.9 or newer and npm.
 
 ```bash
-cd securevault
 npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). For a production build, run `npm run build` and then `npm start`.
+If running from the original MUET Transport repository, first `cd securevault`. For persistent history locally, create `.env.local` from `.env.example` and set valid Turso credentials. Without those values, encryption remains usable and history is only kept in memory for the current visit. Open [http://localhost:3000](http://localhost:3000). For a production build, run `npm run build` and then `npm start`.
+
+## Connect Turso
+
+Create a Turso database using the [Turso Cloud quickstart](https://docs.turso.tech/quickstart). The project uses the `@libsql/client` TypeScript SDK with a server-side client suitable for serverless functions such as Vercel.
+
+```bash
+turso auth login
+turso db create securevault
+turso db show --url securevault
+turso db tokens create securevault
+```
+
+Copy the database URL and generated token into `.env.local` as `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`. Add those same two variables in Vercel under **Project Settings → Environment Variables** for Production and Preview, then redeploy. Keep the token secret; do not add it to `NEXT_PUBLIC_*` variables or commit `.env.local`. The app creates its history table automatically on its first API request.
 
 ## Quality checks
 
@@ -42,9 +54,9 @@ The crypto-format test suite checks encrypt/decrypt round trips, binary and empt
 
 ## Deploy to Vercel through GitHub
 
-1. Commit and push this repository to GitHub.
-2. In Vercel, choose **Add New → Project**, import the GitHub repository, and configure **Root Directory** as `securevault`.
-3. Keep the detected framework as **Next.js**. Use the standard npm install command `npm install`, build command `npm run build`, and leave the output directory at its default (do not set `dist`). No environment variables are required.
+1. In Vercel, choose **Add New → Project** and import `gabolguljabeen-code/securevault`.
+2. Keep **Root Directory** at `./` and the detected framework as **Next.js**. Use the standard `npm install` install command and `npm run build` build command; leave the output directory at its default.
+3. Add `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` to the Vercel project environment variables. Do not add any other variables.
 4. Deploy. Future pushes to the connected branch trigger a new deployment. Use the HTTPS deployment URL for the browser Web Crypto API.
 
 The app includes restrictive baseline security headers in `next.config.ts`. Review the Content Security Policy if adding future scripts, analytics, remote assets, or integrations; none are needed by the current app.
@@ -56,7 +68,7 @@ The app includes restrictive baseline security headers in `next.config.ts`. Revi
 3. Open the downloaded file in a text editor or inspect its first bytes: the header is visible, while file content is ciphertext.
 4. Choose **Decrypt a file**, select that `.svault`, enter the same password, and compare the downloaded original with the source.
 5. Repeat with a wrong password and with a copy of the vault whose ciphertext has been changed. Both must fail authentication and produce no decrypted file.
-6. Reload the page and notice that recent activity is gone. The downloaded encrypted file can still be decrypted, because its non-secret parameters travel inside the authenticated file header.
+6. Reload the page in the same browser and see that operation history is restored from Turso. Clear it with **Clear history**. The downloaded encrypted file can still be decrypted in another browser, because its non-secret parameters travel inside the authenticated file header.
 
 ## Limitations and safe use
 
@@ -65,4 +77,5 @@ The app includes restrictive baseline security headers in `next.config.ts`. Revi
 - Use a strong, unique password and keep a separate copy. SecureVault cannot reset passwords or recover a lost key. Anyone with the password and `.svault` file can decrypt it.
 - Browser-based encryption does not protect against malware, a compromised device, malicious browser extensions, or a compromised site/deployment that serves altered JavaScript. A secure connection and trusted device matter.
 - Metadata such as the original filename and MIME type is visible in the `.svault` header. Do not use sensitive information in filenames if that metadata must remain private.
+- Turso stores operation filenames and file sizes for history; do not encrypt files with sensitive names if this metadata must not leave the browser. The database credentials are used only by server-side routes. History is associated with an anonymous browser cookie, not a verified account, and is not shared across devices.
 - No encryption tool guarantees that the entire device or application is secure. Do not treat this educational project as a substitute for a reviewed, audited product or an organizational backup policy.

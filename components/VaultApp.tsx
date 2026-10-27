@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import type { MouseEvent } from "react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Activity, ArrowLeft, ArrowRight, BookOpen, Check, ChevronRight, CircleHelp, Clock3, FileArchive, FileKey2, FileLock2, Fingerprint, Info, KeyRound, LockKeyhole, Shield, ShieldCheck, Sparkles, Trash2, UnlockKeyhole, Upload, X } from "lucide-react";
 import { decryptBytes, encryptBytes, FILE_SIZE_LIMIT, formatBytes, sanitizeFilename, VaultError } from "@/lib/crypto";
 
@@ -41,9 +41,69 @@ export default function VaultApp() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [history, setHistory] = useState<Operation[]>([]);
+  const [historyAvailable, setHistoryAvailable] = useState<boolean | null>(null);
+  const [historyNotice, setHistoryNotice] = useState("");
   const [tab, setTab] = useState<"vault" | "learn">("vault");
   const inputRef = useRef<HTMLInputElement>(null);
+  const historyRevision = useRef(0);
   const rating = passwordRating(password);
+
+  useEffect(() => {
+    const revision = historyRevision.current;
+    let cancelled = false;
+    fetch("/api/history", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Turso unavailable");
+        return response.json() as Promise<{ history: Operation[] }>;
+      })
+      .then((data) => {
+        if (cancelled || historyRevision.current !== revision) return;
+        setHistory(data.history);
+        setHistoryAvailable(true);
+        setHistoryNotice("");
+      })
+      .catch(() => {
+        if (cancelled || historyRevision.current !== revision) return;
+        setHistoryAvailable(false);
+        setHistoryNotice("Turso is not connected yet. Recent activity will stay in memory for this visit.");
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function saveOperation(item: Operation) {
+    historyRevision.current += 1;
+    if (historyAvailable === false) { setHistory((items) => [item, ...items]); return; }
+    try {
+      const response = await fetch("/api/history", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: item.filename, mode: item.mode, size: item.size }),
+      });
+      if (!response.ok) throw new Error("Turso write failed");
+      const data = await response.json() as { history: Operation[] };
+      setHistory(data.history);
+      setHistoryAvailable(true);
+      setHistoryNotice("");
+    } catch {
+      setHistory((items) => [item, ...items]);
+      setHistoryAvailable(false);
+      setHistoryNotice("This operation completed, but Turso could not save its history. Showing this visit's activity only.");
+    }
+  }
+
+  async function clearHistory() {
+    historyRevision.current += 1;
+    if (historyAvailable) {
+      try {
+        const response = await fetch("/api/history", { method: "DELETE" });
+        if (!response.ok) throw new Error("Turso delete failed");
+      } catch {
+        setHistoryNotice("Could not clear saved history from Turso. Try again when the database is available.");
+        return;
+      }
+    }
+    setHistory([]);
+    setHistoryNotice("");
+  }
 
   function chooseMode(next: Mode) {
     if (busy) return;
@@ -74,13 +134,13 @@ export default function VaultApp() {
         try { download(new Blob([vault.buffer.slice(vault.byteOffset, vault.byteOffset + vault.byteLength) as ArrayBuffer], { type: "application/octet-stream" }), vaultName); }
         finally { vault.fill(0); }
         setSuccess(`Encrypted ${file.name} with AES-256-GCM. Your .svault download is ready.`);
-        setHistory((items) => [{ id: crypto.randomUUID(), filename: file.name, mode, at: new Date().toLocaleString(), size: file.size }, ...items]);
+        await saveOperation({ id: crypto.randomUUID(), filename: file.name, mode, at: new Date().toISOString(), size: file.size });
       } else {
         const result = await decryptBytes(bytes, password);
         try { download(new Blob([result.data.buffer.slice(result.data.byteOffset, result.data.byteOffset + result.data.byteLength) as ArrayBuffer], { type: result.mimeType }), result.filename); }
         finally { result.data.fill(0); }
         setSuccess(`Authentication succeeded. ${result.filename} has been downloaded.`);
-        setHistory((items) => [{ id: crypto.randomUUID(), filename: result.filename, mode, at: new Date().toLocaleString(), size: file.size }, ...items]);
+        await saveOperation({ id: crypto.randomUUID(), filename: result.filename, mode, at: new Date().toISOString(), size: file.size });
       }
       setPassword(""); setConfirm("");
     } catch (reason) {
@@ -122,7 +182,7 @@ export default function VaultApp() {
           <aside className="method-column"><div className="method-title"><span className="mini-shield"><Shield size={15}/></span><div><strong>Protection details</strong><small>Cryptography in use</small></div></div><div className="method-row"><span className="method-symbol">01</span><div><strong>AES-256-GCM</strong><small>Authenticated file encryption</small></div><Check size={15} className="check-teal"/></div><div className="method-row"><span className="method-symbol">02</span><div><strong>PBKDF2 · SHA-256</strong><small>600,000 password iterations</small></div><Check size={15} className="check-teal"/></div><div className="method-row"><span className="method-symbol">03</span><div><strong>Fresh salt + nonce</strong><small>Randomly generated per file</small></div><Check size={15} className="check-teal"/></div><div className="method-note"><Info size={14}/><span>Keep your password safe. There is no password reset; a lost password means the file cannot be recovered.</span></div></aside></div>
           </section>
           <section className="explain-grid"><article className="explain-card"><span className="explain-icon"><FileKey2 size={18}/></span><div><h3>Confidentiality</h3><p>Encryption scrambles readable data so only someone with the right key can read it.</p></div></article><article className="explain-card"><span className="explain-icon"><ShieldCheck size={18}/></span><div><h3>Integrity</h3><p>Authentication detects changes. A wrong password or altered file will fail to open.</p></div></article><article className="explain-card"><span className="explain-icon"><Sparkles size={18}/></span><div><h3>Your key, your control</h3><p>Your password derives a unique key. SecureVault never stores or transmits it.</p></div></article></section>
-          <section className="history-section"><div className="history-heading"><div><div className="section-kicker">THIS PAGE SESSION ONLY</div><h2>Recent activity</h2></div>{history.length > 0 && <button className="clear-button" onClick={() => setHistory([])}><Trash2 size={14}/> Clear history</button>}</div>{history.length === 0 ? <div className="empty-history"><span className="empty-icon"><Clock3 size={18}/></span><div><strong>No activity yet</strong><small>Completed operations will appear here until this page session ends.</small></div></div> : <div className="history-list">{history.map((item) => <div className="history-item" key={item.id}><span className={`history-icon ${item.mode}`} >{item.mode === "encrypt" ? <LockKeyhole size={15}/> : <UnlockKeyhole size={15}/>}</span><span className="history-name"><strong>{item.filename}</strong><small>{item.mode === "encrypt" ? "Encrypted" : "Decrypted"} · AES-256-GCM</small></span><span className="history-time">{item.at}</span><span className="history-size">{formatBytes(item.size)}</span></div>)}</div>}</section>
+          <section className="history-section"><div className="history-heading"><div><div className="section-kicker">{historyAvailable === true ? "SAVED IN TURSO · THIS BROWSER" : historyAvailable === false ? "SESSION HISTORY · TURSO OFFLINE" : "CONNECTING TO TURSO…"}</div><h2>Recent activity</h2></div>{history.length > 0 && <button className="clear-button" onClick={clearHistory}><Trash2 size={14}/> Clear history</button>}</div><p className="history-storage-note">Turso stores filenames, operation types, and file sizes for this browser. File contents, passwords, and encryption keys stay on your device.</p>{historyNotice && <p className="history-notice" role="status"><Info size={13}/>{historyNotice}</p>}{history.length === 0 ? <div className="empty-history"><span className="empty-icon"><Clock3 size={18}/></span><div><strong>No activity yet</strong><small>{historyAvailable === true ? "Completed operations will be saved in Turso for this browser." : "Completed operations will appear here for this visit."}</small></div></div> : <div className="history-list">{history.map((item) => <div className="history-item" key={item.id}><span className={`history-icon ${item.mode}`} >{item.mode === "encrypt" ? <LockKeyhole size={15}/> : <UnlockKeyhole size={15}/>}</span><span className="history-name"><strong>{item.filename}</strong><small>{item.mode === "encrypt" ? "Encrypted" : "Decrypted"} · AES-256-GCM</small></span><span className="history-time">{new Date(item.at).toLocaleString()}</span><span className="history-size">{formatBytes(item.size)}</span></div>)}</div>}</section>
           <section className="security-callout"><span className="callout-icon"><Shield size={19}/></span><div><strong>Built for local privacy. Browser limits still apply.</strong><p>Local encryption cannot protect against malware, compromised devices, malicious extensions, or a compromised website deployment. Use a trusted, updated device and keep a separate backup of important files.</p></div><button onClick={() => setTab("learn")} aria-label="Read security limitations"><ArrowRight size={17}/></button></section>
         </div>
       </> : <LearnPage onBack={() => setTab("vault")} />}
