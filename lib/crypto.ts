@@ -5,16 +5,26 @@ const HEADER_LIMIT = 16 * 1024;
 const ITERATION_MIN = 100_000;
 const ITERATION_MAX = 2_000_000;
 
-export type VaultHeader = {
-  version: 1;
+type VaultHeaderV2 = {
+  version: 2;
   algorithm: "AES-256-GCM";
-  kdf: "PBKDF2-SHA-256";
-  iterations: number;
-  salt: string;
+  keyFormat: "HEX-256";
   nonce: string;
   filename: string;
   mimeType: string;
   createdAt: string;
+};
+
+type ParsedVaultHeader = {
+  version?: number;
+  algorithm?: string;
+  kdf?: string;
+  iterations?: number;
+  salt?: string;
+  nonce?: string;
+  keyFormat?: string;
+  filename?: string;
+  mimeType?: string;
 };
 
 export class VaultError extends Error {
@@ -36,13 +46,26 @@ function fromBase64(value: unknown, length: number, label: string): Uint8Array {
   return bytes;
 }
 
+export function generateEncryptionKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  try { return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""); }
+  finally { bytes.fill(0); }
+}
+
+function fromHexKey(value: string): Uint8Array {
+  if (!/^[a-fA-F0-9]{64}$/.test(value)) {
+    throw new VaultError("Enter the 64-character key shown after encryption.");
+  }
+  return Uint8Array.from(value.match(/.{2}/g)!, (byte) => Number.parseInt(byte, 16));
+}
+
 export function sanitizeFilename(input: string): string {
   const name = input.split(/[\\/]/).pop() ?? "";
   const cleaned = name.replace(/[\u0000-\u001f\u007f<>:"|?*]/g, "_").replace(/[. ]+$/g, "").trim();
   return cleaned && cleaned !== "." && cleaned !== ".." ? cleaned.slice(0, 180) : "decrypted-file";
 }
 
-async function deriveKey(password: string, salt: Uint8Array, iterations: number): Promise<CryptoKey> {
+async function deriveLegacyKey(password: string, salt: Uint8Array, iterations: number): Promise<CryptoKey> {
   const passwordBytes = new TextEncoder().encode(password);
   let material: CryptoKey;
   try {
@@ -59,6 +82,10 @@ async function deriveKey(password: string, salt: Uint8Array, iterations: number)
   );
 }
 
+async function importRawKey(rawKey: Uint8Array): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", rawKey as BufferSource, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
 function authenticatedHeader(headerBytes: Uint8Array): Uint8Array {
   const prefix = new Uint8Array(MAGIC.length + 4 + headerBytes.length);
   prefix.set(MAGIC, 0);
@@ -67,20 +94,19 @@ function authenticatedHeader(headerBytes: Uint8Array): Uint8Array {
   return prefix;
 }
 
-export async function encryptBytes(data: Uint8Array, filename: string, mimeType: string, password: string): Promise<Uint8Array> {
-  if (!password) throw new VaultError("Enter a password before encrypting.");
+export async function encryptBytes(data: Uint8Array, filename: string, mimeType: string, keyHex: string): Promise<Uint8Array> {
   if (data.byteLength > FILE_SIZE_LIMIT) throw new VaultError("This file is larger than the 64 MiB limit.");
-  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const rawKey = fromHexKey(keyHex);
   const nonce = crypto.getRandomValues(new Uint8Array(12));
-  const header: VaultHeader = {
-    version: 1, algorithm: "AES-256-GCM", kdf: "PBKDF2-SHA-256", iterations: PBKDF2_ITERATIONS,
-    salt: toBase64(salt), nonce: toBase64(nonce), filename: sanitizeFilename(filename),
+  const header: VaultHeaderV2 = {
+    version: 2, algorithm: "AES-256-GCM", keyFormat: "HEX-256", nonce: toBase64(nonce),
+    filename: sanitizeFilename(filename),
     mimeType: /^[\w.+-]+\/[\w.+-]+$/.test(mimeType) ? mimeType : "application/octet-stream",
     createdAt: new Date().toISOString(),
   };
   const headerBytes = new TextEncoder().encode(JSON.stringify(header));
   const aad = authenticatedHeader(headerBytes);
-  const key = await deriveKey(password, salt, PBKDF2_ITERATIONS);
+  const key = await importRawKey(rawKey);
   let cipher: Uint8Array | null = null;
   try {
     cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce as BufferSource, additionalData: aad as BufferSource, tagLength: 128 }, key, data as BufferSource));
@@ -88,12 +114,12 @@ export async function encryptBytes(data: Uint8Array, filename: string, mimeType:
     out.set(aad); out.set(cipher, aad.length);
     return out;
   } finally {
-    salt.fill(0); nonce.fill(0); headerBytes.fill(0); aad.fill(0); cipher?.fill(0);
+    rawKey.fill(0); nonce.fill(0); headerBytes.fill(0); aad.fill(0); cipher?.fill(0);
   }
 }
 
-export async function decryptBytes(file: Uint8Array, password: string): Promise<{ data: Uint8Array; filename: string; mimeType: string }> {
-  if (!password) throw new VaultError("Enter the password used to encrypt this file.");
+export async function decryptBytes(file: Uint8Array, keyOrLegacyPassword: string): Promise<{ data: Uint8Array; filename: string; mimeType: string }> {
+  if (!keyOrLegacyPassword) throw new VaultError("Enter the decryption key shown after encryption.");
   if (file.byteLength < MAGIC.length + 4 + 16) throw new VaultError("This file is too short to be a valid SecureVault file.");
   if (!MAGIC.every((byte, index) => file[index] === byte)) throw new VaultError("This is not a valid SecureVault file (header marker not found).");
   const headerLength = new DataView(file.buffer, file.byteOffset, file.byteLength).getUint32(MAGIC.length, false);
@@ -101,26 +127,39 @@ export async function decryptBytes(file: Uint8Array, password: string): Promise<
   const cipherStart = headerStart + headerLength;
   if (headerLength < 2 || headerLength > HEADER_LIMIT || cipherStart > file.byteLength - 16) throw new VaultError("The encrypted file header is invalid or corrupted.");
   const headerBytes = file.slice(headerStart, cipherStart);
-  let header: Partial<VaultHeader>;
-  try { header = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(headerBytes)) as Partial<VaultHeader>; }
+  let header: ParsedVaultHeader;
+  try { header = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(headerBytes)) as ParsedVaultHeader; }
   catch { throw new VaultError("The encrypted file header is not valid JSON."); }
-  if (header.version !== 1 || header.algorithm !== "AES-256-GCM" || header.kdf !== "PBKDF2-SHA-256") throw new VaultError("This SecureVault version or algorithm is not supported.");
-  if (!Number.isSafeInteger(header.iterations) || header.iterations! < ITERATION_MIN || header.iterations! > ITERATION_MAX) throw new VaultError("The encrypted file has unsafe key-derivation settings.");
-  const salt = fromBase64(header.salt, 16, "salt");
-  const nonce = fromBase64(header.nonce, 12, "nonce");
+
+  if (header.algorithm !== "AES-256-GCM") throw new VaultError("This SecureVault version or algorithm is not supported.");
+  let nonce: Uint8Array;
+  let salt: Uint8Array | null = null;
+  let rawKey: Uint8Array | null = null;
+  let key: CryptoKey;
+  if (header.version === 2 && header.keyFormat === "HEX-256") {
+    nonce = fromBase64(header.nonce, 12, "nonce");
+    rawKey = fromHexKey(keyOrLegacyPassword);
+    key = await importRawKey(rawKey);
+  } else if (header.version === 1 && header.kdf === "PBKDF2-SHA-256") {
+    if (!Number.isSafeInteger(header.iterations) || header.iterations! < ITERATION_MIN || header.iterations! > ITERATION_MAX) throw new VaultError("The encrypted file has unsafe key-derivation settings.");
+    salt = fromBase64(header.salt, 16, "salt");
+    nonce = fromBase64(header.nonce, 12, "nonce");
+    key = await deriveLegacyKey(keyOrLegacyPassword, salt, header.iterations!);
+  } else {
+    throw new VaultError("This SecureVault version or algorithm is not supported.");
+  }
   if (typeof header.filename !== "string" || typeof header.mimeType !== "string") throw new VaultError("The encrypted file is missing required metadata.");
   const aad = file.slice(0, cipherStart);
   const ciphertext = file.slice(cipherStart);
-  const key = await deriveKey(password, salt, header.iterations!);
   try {
     const plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce as BufferSource, additionalData: aad as BufferSource, tagLength: 128 }, key, ciphertext as BufferSource));
     if (plain.byteLength > FILE_SIZE_LIMIT) { plain.fill(0); throw new VaultError("The decrypted file is larger than the 64 MiB limit."); }
     return { data: plain, filename: sanitizeFilename(header.filename), mimeType: /^[\w.+-]+\/[\w.+-]+$/.test(header.mimeType) ? header.mimeType : "application/octet-stream" };
   } catch (error) {
     if (error instanceof VaultError) throw error;
-    throw new VaultError("Decryption failed. The password may be wrong, or the file may have been modified or corrupted.");
+    throw new VaultError("Decryption failed. The key may be wrong, or the file may have been modified or corrupted.");
   } finally {
-    salt.fill(0); nonce.fill(0); headerBytes.fill(0); aad.fill(0); ciphertext.fill(0);
+    rawKey?.fill(0); salt?.fill(0); nonce.fill(0); headerBytes.fill(0); aad.fill(0); ciphertext.fill(0);
   }
 }
 
